@@ -13,6 +13,8 @@ from django.contrib.auth.hashers import make_password
 from django.conf import settings
 from django.core.mail import send_mail
 from rest_framework import status
+from django.contrib.auth.hashers import check_password
+from django.contrib.auth.models import User
 
 
 # Create your views here.
@@ -25,7 +27,7 @@ def register_view(request):
     email = request.data.get('email')
     if CustomUser.objects.filter(email=email).exists():
         return Response({'error': 'Email already exists'}, status=status.HTTP_400_BAD_REQUEST)
-    
+        
     s = UserSerializers(data=request.data)
     if s.is_valid():
         user = CustomUser.objects.create_user(username = request.data.get('username'),
@@ -127,26 +129,15 @@ def delete_category(request,id):
     category.delete()
     return Response(status=status.HTTP_204_NO_CONTENT)  
 
-# @api_view(['POST'])
-# @permission_classes([IsAuthenticated])
-# def donate_pet(request):
-    
-#     serializer = PetsDataSerializers(data=request.data)
-#     if serializer.is_valid():
-#         data = Category.objects.create(category=request.data.get('category'),
-#                                        age=request.data.get('age'),
-#                                        breed=request.data.get('breed'),
-#                                        description=request.data.get('description'),
-#                                        image=request.data.get('image'))
-#         data.save()
-#         return Response(serializer.data)
-#     else:
-#         return Response(serializer.errors)
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def donate_pet(request):
-    serializer = PetsDataSerializers(data=request.data)
+    data = request.data.copy()  # Make a copy of the request data
+    data['donor_id'] = request.user.id  # Add the donor's ID to the data
+    print(data['donor_id'])
+
+    serializer = PetDetailsSerializers(data=data)
     if serializer.is_valid():
         serializer.save()
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -157,60 +148,248 @@ def donate_pet(request):
 @permission_classes([IsAdminUser])
 def get_donation_requests(request):
 
-    requests = PetsData.objects.filter(status = 0)
-    serializers = PetsDataSerializers(requests,many=True)
-    return Response(serializers.data)  
+    requests = PetDetails.objects.filter(status = 0)
+    serializers = PetDetailsSerializers(requests,many=True)
+    return Response(serializers.data) 
 
-#------------------------------------------------------------------------------------
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def approve_donation_request(request, id):
+    try:
+        pet = PetDetails.objects.get(id=id)
+    except PetDetails.DoesNotExist:
+        return Response(status=status.HTTP_404_NOT_FOUND)
+
+    data = request.data
+    serializer = PetDetailsSerializers(pet, data=data, partial=True)
+    
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST) 
+
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def cancel_donation_request(request, id):
+    try:
+        pet = PetDetails.objects.get(id=id)
+    except PetDetails.DoesNotExist:
+        return Response(status=status.HTTP_404_NOT_FOUND)
+
+    data = request.data
+    serializer = PetDetailsSerializers(pet, data=data, partial=True)
+    
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST) 
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_category_wise_data(request, id):
+    try:
+        pets = PetDetails.objects.filter(category_id=id,available = True,status = 1)
+        serializer = PetDetailsSerializers(pets, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    except PetDetails.DoesNotExist:
+        return Response(status=status.HTTP_404_NOT_FOUND)
+    
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def adopt_pet(request):
+    user = request.user
+    pet_id = request.data.get('pet_id')
+    print(pet_id)
+    
+    if not pet_id:
+        return Response({'status': 'error', 'message': 'Pet ID is required'}, status=400)
+
+    try:
+        pet = PetDetails.objects.get(id=pet_id)
+    except PetDetails.DoesNotExist:
+        return Response({'status': 'error', 'message': 'Pet not found'}, status=404)
+    
+    pet.available = False
+    pet.save()
+    notification = AdoptionNotification.objects.create(pet=pet, user=user,message = 'Your pet has been Adopted!')
+    adoption = AdoptedPets.objects.create(pet=pet, user=user)
+    return Response({'status': 'success', 'message': 'Pet adopted successfully!'})
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-def ok(request):
-
-    users = UserData.objects.all()
-    serializers = UserDataSerializers(users,many=True)
-    arr=[]
-    for user in users:
-        username = {"name":user.name,"age":user.age}
-        arr.append(username)
-    print(arr)
+def get_donor_notifications(request):
+    notif = AdoptionNotification.objects.filter(pet__donor=request.user)
+    serializers = AdoptionNotificationSerializers(notif,many=True)
     return Response(serializers.data)
 
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def handle_donor_notification(request, id):
+    try:
+        notif = AdoptionNotification.objects.get(id=id)
+    except AdoptionNotification.DoesNotExist:
+        return Response(status=status.HTTP_404_NOT_FOUND)
+
+    data = request.data
+    serializer = AdoptionNotificationSerializers(notif, data=data, partial=True)
+    
+    if serializer.is_valid():
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_notification_count(request):
+    count = AdoptionNotification.objects.filter(pet__donor=request.user,status=0).count()
+    rcount = PetDetails.objects.filter(status=0).count()
+    return Response({'count': count,
+                     'rcount':rcount})
 
 
-class Userview(APIView):
-    permission_classes = [IsAuthenticated]
-    def get(self,request):
-        users = UserData.objects.all()
-        e = UserDataSerializers(users,many=True)
-        return Response(e.data)
+@api_view(['PATCH'])
+@permission_classes([IsAuthenticated])
+def update_password(request):
+    user = request.user
+    data = request.data
 
-    def post(self,request):
-        serializer = UserDataSerializers(data=request.data)
+    print(user)
+    print(data)
+
+    current_password = data.get('cp')
+    new_password = data.get('np')
+
+    # Check if the current password is correct
+    if not user.check_password(current_password):
+        return Response({'error': 'Current password is incorrect.'}, status=400)
+
+    # Ensure the new password is not the same as the current password
+    if current_password == new_password:
+        return Response({'error': 'New password cannot be the same as the current password.'}, status=400)
+
+    # Set the new password
+    user.set_password(new_password)
+    user.save()
+
+    return Response({'success': 'Password updated successfully.'})
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_purchase_details(request, id):
+    try:
+        print(id)
+        details = AdoptedPets.objects.filter(user__id=id)
+        print(details)
+        serializer = AdoptedPetsSerializers(details, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    except AdoptedPets.DoesNotExist:
+        return Response(status=status.HTTP_404_NOT_FOUND)
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_donation_details(request, id):
+    try:
+        details = PetDetails.objects.filter(donor__id=id,status=1)
+        serializer = PetDetailsSerializers(details, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    except AdoptedPets.DoesNotExist:
+        return Response(status=status.HTTP_404_NOT_FOUND)
+    
+
+@api_view(['DELETE'])
+@permission_classes([IsAdminUser])
+def delete_pet(request,id):
+    print('deletepet')
+    try:
+        pet = PetDetails.objects.get(id=id)
+        pet.delete()
+        return Response({'donor_id': pet.donor_id}, status=status.HTTP_200_OK)
+    except PetDetails.DoesNotExist:
+        return Response({'error': 'Pet not found'}, status=status.HTTP_404_NOT_FOUND)
+   
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_profile_data(request):
+
+    user = request.user
+    serializer = UserSerializers(user)
+    print(serializer.data)
+    return Response(serializer.data)
+    
+@api_view(['GET', 'PUT'])
+@permission_classes([IsAuthenticated])
+def update_profile_data(request):
+    user = request.user
+
+    if request.method == 'GET':
+        serializer = UserSerializers(user)
+        return Response(serializer.data)
+
+    elif request.method == 'PUT':
+        data = request.data
+
+        email = request.data.get('email')
+        # if 'email' in data and User.objects.filter(email=data['email']).exclude(id=user.id).exists():
+        if CustomUser.objects.filter(email=email).exclude(id=user.id).exists():
+            return Response({'error': 'Email already exists'}, status=status.HTTP_400_BAD_REQUEST)
+
+        username = request.data.get('username')
+        if CustomUser.objects.filter(username=username).exclude(id=user.id).exists():
+            return Response({'error': 'Username already exists'}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = UserSerializers(user, data=data, partial=True)
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data)
-        else:
-            return Response(serializer.errors)
-        
-    def delete(self,request,id=None):
-        if id: 
-            userobj = UserData.objects.get(id=id)
-            userobj.delete()
-            return JsonResponse({'data':'data deleted'})
-        else:
-            return JsonResponse({'error':'give an id as url param'})
-        
-    def put(self,request,id=None):
-        if id:
-            userobj = UserData.objects.get(id=id)
-            s = UserDataSerializers(data=request.data)
-            if s.is_valid():
-                userobj.name = request.data.get('name')
-                userobj.location = request.data.get('location')
-                userobj.about = request.data.get('about')
-                userobj.age = request.data.get('age')
-                userobj.save()
-                return Response(s.data)
-            else:
-                return Response(s.errors)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)   
+
+# @api_view(['GET', 'PUT'])
+# @permission_classes([IsAuthenticated])
+# def update_profile_data(request):
+#     user = request.user
+
+#     if request.method == 'GET':
+#         serializer = UserSerializers(user)
+#         return Response(serializer.data)
+
+#     elif request.method == 'PUT':
+#         data = request.data
+
+#         # Check if email already exists and is not the current user's email
+#         if 'email' in data and User.objects.filter(email=data['email']).exclude(id=user.id).exists():
+#             return Response({"error": "Email already exists"}, status=status.HTTP_400_BAD_REQUEST)
+
+#         # Check if username already exists and is not the current user's username
+#         if 'username' in data and User.objects.filter(username=data['username']).exclude(id=user.id).exists():
+#             return Response({"error": "Username already exists"}, status=status.HTTP_400_BAD_REQUEST)
+
+#         serializer = UserSerializers(user, data=data, partial=True)
+#         if serializer.is_valid():
+#             serializer.save()
+#             return Response(serializer.data)
+#         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_adopted_pets(request):
+    pets = AdoptedPets.objects.filter(user=request.user)
+    serializers = AdoptedPetsSerializers(pets,many=True)
+    return Response(serializers.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_donated_pets(request):
+    pets = PetDetails.objects.filter(donor=request.user)
+    serializers = PetDetailsSerializers(pets,many=True)
+    return Response(serializers.data)
+#------------------------------------------------------------------------------------
+
